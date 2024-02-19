@@ -20,6 +20,7 @@ export SLACK_BASE_URL=<Slack Webhook URL>
 - AWS_CONFIG : AWS IAM User Credentials
 - BUCKETNAME : SBOM Report storage bucket name
 - KMSKEYARN : SBOM Report Encryption KMS Customer Key ARN Address
+- SLACK_BASE_URL : Slack Webhook URL
 
 ## Usage
 ```
