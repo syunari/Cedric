@@ -15,6 +15,7 @@ Have you heard of the serverless Top 10 vulnerabilities that OWASP announced in 
 export AWS_CONFIG={'Account ID': <AWS Account ID>, 'Account Name':<AWS Account Name>, 'AWS_ACCESS_KEY': <IAM Credential ACCESS KEY>, 'AWS_SECRET_KEY':'<IAM Credential Secret KEY>'}
 export BUCKETNAME = <S3 Bucket Name>
 export KMSKEYARN=<KMS Customer Key Arn>
+export SLACK_BASE_URL=<Slack Webhook URL>
 ```
 - AWS_CONFIG : AWS IAM User Credentials
 - BUCKETNAME : SBOM Report storage bucket name
