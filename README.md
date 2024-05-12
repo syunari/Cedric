@@ -24,7 +24,7 @@ export SLACK_BASE_URL=<Slack Webhook URL>
 
 ## Usage
 ```
-python setup.py
+python main.py
 ```
 
 ## ✨ Restrictions
