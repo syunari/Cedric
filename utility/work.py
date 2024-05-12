@@ -1,392 +1,536 @@
 import json
-import ast
-import time
-import boto3
 import os
+import shutil
 import logging
-import warnings
-import urllib3
-import requests
-from urllib3.util.ssl_ import create_urllib3_context
-from requests.adapters import HTTPAdapter
-import utility.aws as awsUtil
-from utility.work import COMMON, LMD, EC2
-import argparse
-import sys
+import hashlib
+import zipfile
+import glob
+import utility.aws as awsUtill
+import glob
+import time
 
 logging.basicConfig(level=logging.INFO)
+BASE_VENV_PATH = "/tmp/python"  # lambda 용
+BASE_VENV_PATH = "/Users/eddi/Desktop/layer/python"  # local 용
+global s3Util
+global inspectUtil
+global ssmUtil
+global lmdUtil
 
-try:
-    AWS_CONFIG = os.environ["AWS_CONFIG"]
-    BUCKETNAME = os.environ["BUCKETNAME"]
-    KMSKEYARN = os.environ["KMSKEYARN"]
-    SLACK_WEBHOOK_URL = os.environ["SLACK_WEBHOOK_URL"]
-    INSPECTOR_REPORT_FORMAT = os.environ["INSPECTOR_REPORT_FORMAT"]
-except KeyError as e:
-    print(
+
+class COMMON:
+    def __init__(self, client):
+        self.client = client
+
+    def export_inspecotrSbom(self, inspector_report_format, bucketName, kmskeyarn):
+        global inspectUtil
+        inspectUtil = awsUtill.inspectorUtil(self.client)
+        response = inspectUtil.create_sbom_export(
+           inspector_report_format, bucketName, kmskeyarn
+        )
+        ### checking if job is completed else wait and retry until job is completed
+        while True:
+            response = inspectUtil.get_sbom_export(
+                response["reportId"]
+            )
+            if response['status'] != 'SUCCEEDED':
+                logging.info("Printing aws lambda sbom report. Please wait a moment....")
+                time.sleep(30) #약 3분30초 소요
+            else :
+                objReportdId = response["reportId"]
+                break
+        
+        return objReportdId
+
+    def collection_bucketData(self, bucketName, Prefix):
+        global s3Util
+        s3Util = awsUtill.s3Util(self.client)
+
+        page_iterator = s3Util.get_paginator("list_objects_v2")
+        inspectorScannList = []
+
+        for page in page_iterator.paginate(Bucket=bucketName, Prefix=Prefix):
+            try:
+                bucketObjList = page["Contents"]
+            except KeyError:
+                break
+
+            for objItem in bucketObjList:
+                objectData = s3Util.get_object(bucketName, objItem["Key"])
+                bucket_inspectData = json.loads(
+                    objectData["Body"].read().decode("utf-8")
+                )
+
+                """
+                If components is [] in the inspector2 scan result
+                There is no vulnerable content.
+                Or, if EC2 Instance inspection permission exists
+                """
+                if bucket_inspectData["components"] == []:
+                    pass
+                else:
+                    if len(bucket_inspectData["vulnerabilities"]) == 0:
+                        pass
+                    else:
+                        logging.info(
+                            "{}".format(bucket_inspectData["metadata"]["properties"][4])
+                        )
+                        inspectorScannList.append(bucket_inspectData)
+        return inspectorScannList
+
+
+class LMD(COMMON):
+    def __init__(self, client):
+        self.client = client
+
+    def check_dependLib(self, require_info):
+        if require_info.find("backports.zoneinfo") > -1:
+            require_info = [
+                require_info.replace(
+                    libName,
+                    'backports.zoneinfo;python_version<"3.9"',
+                )
+                for libName in require_info.split("\n")
+                if "backports.zoneinfo" in libName
+            ].pop()
+
+        if require_info.find("aws-dd-forwarder>=0.0.0.dev0") > -1:
+            require_info = [
+                require_info.replace(libName, "")
+                for libName in require_info.split("\n")
+                if "aws-dd-forwarder>=0.0.0.dev0" in libName
+            ].pop()
+
+        if require_info.find("urllib3") > -1:
+            require_info = [
+                require_info.replace(
+                    libName,
+                    'urllib3<2.1,>=1.25.4; python_version >= "3.10"',
+                )
+                for libName in require_info.split("\n")
+                if "urllib3" in libName
+            ].pop()
+
+        return require_info
+
+    def export_fixVersion(self, sbomInfo):
+        require_Libversion = ""
+        for packages in sbomInfo[0]["packages"]:
+            # 취약점 라이브러리만 별도
+            # requirements.txt 작성
+            try:
+                if "cveInfo" in packages.keys():
+                    libCVE = list(
+                        filter(
+                            lambda cveinfo: cveinfo["name"] == packages["name"],
+                            packages["cveInfo"],
+                        )
+                    )
+                    require_Ver = [
+                        i["fixedInVersion"]
+                        for i in libCVE
+                        if i["fixedInVersion"] != "No"
+                    ]
+                    """
+                    release major version is multiple
+                    ex:) python2.7, 3.7
+                    urllib 2.0.7, 1.26.18
+                    """
+                    majorRelease_version = list(
+                        set(
+                            [
+                                release.replace(" ", "").split(".")[0]
+                                for release in sum(
+                                    [x.split(",") for x in require_Ver if "," in x],
+                                    [],
+                                )
+                            ]
+                        )
+                    )
+                    if len(majorRelease_version) == 1:
+                        # print ("release version 1")
+                        updateVersion = self.get_latest_version(
+                            [
+                                version.replace(" ", "")
+                                for version in sum(
+                                    [x.split(",") for x in require_Ver if "," in x],
+                                    [],
+                                )
+                            ]
+                        )
+                        print("updateVersion : {}".format(updateVersion))
+                        require_Libversion = (
+                            require_Libversion
+                            + str(packages["name"])
+                            + ">="
+                            + updateVersion
+                            + "\n"
+                        )
+                        """
+                        release major version is two
+                        ex:) python2.7, 3.7
+                        urllib 2.0.7, 1.26.18
+                        """
+                    elif len(majorRelease_version) == 2:
+                        updateVersion = [
+                            version.replace(" ", "")
+                            for version in sum(
+                                [x.split(",") for x in require_Ver if "," in x],
+                                [],
+                            )
+                        ]
+                        releaseVersion_1, releaseVersion_2 = self.compare_versions(
+                            updateVersion
+                        )
+                        tmp = self.get_latest_version(releaseVersion_1)
+                        requireVersion = str(packages["name"]) + ">=" + tmp + "\n"
+                        tmp = ""
+                        tmp = self.get_latest_version(releaseVersion_2)
+                        require_Libversion = (
+                            require_Libversion
+                            + requireVersion
+                            + str(packages["name"])
+                            + ">="
+                            + tmp
+                            + "\n"
+                        )
+                    else:
+                        updateVersion = require_Ver.pop()
+                        require_Libversion = (
+                            require_Libversion
+                            + str(packages["name"])
+                            + ">="
+                            + updateVersion
+                            + "\n"
+                        )
+                # No vulnerabilities exist, but existing
+                # Library dependencies that exist in the layer
+                # Add requirements.txt
+                else:
+                    require_Libversion = (
+                        require_Libversion
+                        + str(packages["name"])
+                        + ">="
+                        + str(packages["version"])
+                        + "\n"
+                    )
+
+            except ValueError as e:
+                """
+                To collect Lib information within a layer where no CVE exists.
+                The above task depends on an existing layer or
+                Purpose of adding Lib where vulnerabilities do not exist
+                """
+                require_Libversion = (
+                    require_Libversion
+                    + str(packages["name"])
+                    + ">="
+                    + str(packages["version"])
+                    + "\n"
+                )
+
         """
-        A required environment variable does not exist.
-        Required environment variables are 'AWS_CONFIG', 'BUCKETNAME',
-        'KMSKEYARN', 'INSPECTOR_REPORT_FORMAT', and 'SLACK_WEBHOOK_URL'.
+        For backports.zoneinfo>=0.2.1 https://buly.kr/1rzrd8
+        # For a specific Lib as above, requirements.txt
+        To change the format other than [Lib][Unequal][Version].
         """
-    )
-    exit()
+        return require_Libversion
 
-warnings.filterwarnings("ignore")
-    
+    def venvSet(self, requirements_lib_version_define):
+        try:
+            if os.path.exists(BASE_VENV_PATH) is True:
+                shutil.rmtree(BASE_VENV_PATH, ignore_errors=True)
 
-class CustomSslContextHttpAdapter(HTTPAdapter):
-    """
-    Transport adapter" that allows us to use a custom ssl context object \
-    with the requests.
-    """
+            # python3 -m venv /tmp/python
+            command1 = os.popen("python3 -m venv " + BASE_VENV_PATH).read()
+            # source /tmp/python/bin/activate
+            command2 = os.popen("source " + BASE_VENV_PATH + "/bin/activate").read()
+            # /Users/eddi/Desktop/layer/python
+            pwd = [os.path.abspath(os.path.join(BASE_VENV_PATH, ".."))]
+            absolute_pwd = pwd[0]
 
-    def init_poolmanager(self, connections, maxsize, block=False):
-        ctx = create_urllib3_context()
-        ctx.load_default_certs()
-        ctx.check_hostname = False
-        ctx.options |= 0x4  # ssl.OP_LEGACY_SERVER_CONNECT
-        self.poolmanager = urllib3.PoolManager(ssl_context=ctx)
+            require_file_pwd = absolute_pwd + "/requirements.txt"
+            # /tmp/python/requirements.txt
+            with open(require_file_pwd, "w") as f:
+                f.write(requirements_lib_version_define)
+            # pip3 install -t /tmp/python -r /tmp/requirements.txt
+            command4 = os.popen(
+                "pip3 install -t " + BASE_VENV_PATH + " -r " + require_file_pwd
+            ).read()
+            absolute_pwd = pwd[0]
+            pwd = [BASE_VENV_PATH]
 
+            with zipfile.ZipFile(absolute_pwd + "/python.zip", "w") as layer:
+                while len(pwd):
+                    fname = pwd.pop(0)
+                    if os.path.isdir(fname):
+                        pwd = glob.glob(fname + os.sep + "*") + pwd
+                        layer.write(fname, fname.split(absolute_pwd)[-1])
 
-def print_help():
-    print("See the examples below to see your options.")
-    help_msg = """
-    Options :
-        -t, --update_target,    This refers to the resource target to \
-                                be updated with sbom. ex:) Lambda, EC2, ECR
-    """
-    print(help_msg)
+                    elif os.path.isfile(fname):
+                        layer.write(fname, fname.split(absolute_pwd)[-1])
 
+            """
+            Zip file Size Checking
+            """
+            zipFileSize = os.path.getsize(absolute_pwd + "/python.zip")
+            
+            if zipFileSize == 112:
+                return "Null"
 
-def slack_blockKit(accountName, resourceName, updateStatus, fileSHA256, writeMsg):
-    sendMsg_format = {
-        "blocks": [
-            {
-                "type": "section",
-                "text": {"type": "mrkdwn", "text": "*Lambda Layer Update* :checked:"},
-            },
-            {"type": "divider"},
-            {
-                "type": "section",
-                "fields": [
+            else:
+                return "successful"
+
+        except Exception as e:
+            return 0
+
+    def compare_versions(versionList):
+        vars_a = []
+        vars_a = vars_a + versionList
+        version1 = []
+        version2 = []
+
+        while len(vars_a) > 0:
+            vers1 = vars_a.pop(0)
+            vers2 = versionList[versionList.index(vers1) + 1]
+
+            if vers1.split(".")[0] != vers2.split(".")[0]:
+                version1.append(vers1)
+                version2.append(vers2)
+            else:
+                version1.append(vers1)
+                version1.append(vers2)
+
+            vars_a.pop(vars_a.index(vers2))
+
+        return (version1, version2)
+
+    def get_latest_version(versions):
+        """
+        Get the latest version from a list of versions.
+        """
+        try:
+            tuple_versions = [
+                tuple(map(int, (version.split(".")))) for version in versions
+            ]
+
+            versions = [
+                x for _, x in sorted(zip(tuple_versions, versions), reverse=True)
+            ]
+            latest_version = versions[0]
+        except Exception as e:
+            print(e)
+            latest_version = None
+
+        return latest_version
+
+    def upload_layer(self, bucketname, serverlessLayerName):
+        pwd = os.path.abspath(os.path.join(BASE_VENV_PATH, ".."))
+        try:
+            if "python.zip" in os.listdir(pwd):
+                zipFilepath = pwd + os.sep + "python.zip"
+                file = open(zipFilepath, "rb")
+                fileSHA256 = hashlib.sha256(file.read()).hexdigest()
+                file.close()
+
+                KEY = (
+                    "update_resource/" + serverlessLayerName + "_" + fileSHA256 + ".zip"
+                )
+
+                uploadRst = s3Util.upload_fileobj(zipFilepath, bucketname, KEY)
+                print(uploadRst)
+                update_req = lmdUtil.publish_layer_version(bucketname, KEY)
+                updateStatus = update_req["ResponseMetadata"]["HTTPStatusCode"]
+
+                if updateStatus == 201:
+                    return update_req["LayerVersionArn"], updateStatus, fileSHA256
+
+                else:
+                    return None, "updateStatus", "fileSHA256"
+
+            else:
+                raise FileExistsError
+
+        except FileExistsError as e:
+            return e
+
+        except Exception as e:
+            print("Layer Uploads Failed")
+            print(e)
+            exit()
+
+    def collection_service_vulnerability(self, inspectorScannList):
+        global lmdUtil
+        lmdUtil = awsUtill.lmbUtil(self.client)
+
+        output = {}
+        for scannInventory in inspectorScannList:
+            for meetaData in scannInventory["metadata"]["properties"]:
+                if "function_name" in meetaData["name"]:
+                    lambdaName = meetaData["value"]
+
+                if "runtime" in meetaData["name"]:
+                    runtime = meetaData["value"]
+
+                if "arn" in meetaData["name"]:
+                    id = meetaData["value"]
+
+            output[lambdaName] = {}
+            lambdaInfo = lmdUtil.get_function(lambdaName)
+
+            """
+            AWS Lambda in Layer dict
+            Among the resource list, what you need is the runtime environment, 
+            id: arn value, layerName functionization
+            """
+
+            for layers in lambdaInfo["Configuration"]["Layers"]:
+                layerName, layerVersion = layers["Arn"].split(":layer:")[-1].split(":")
+
+                output[lambdaName][layerName] = []
+                output[lambdaName][layerName].append(
                     {
-                        "type": "mrkdwn",
-                        "text": ":arrow_forward: *Account Name :"
-                        + str(accountName)
-                        + "*",
-                    },
-                    {
-                        "type": "mrkdwn",
-                        "text": ":arrow_forward: *Layer Name :"
-                        + str(resourceName)
-                        + "*",
-                    },
-                    {
-                        "type": "mrkdwn",
-                        "text": ":arrow_forward: *UpdateStatus:"
-                        + str(updateStatus)
-                        + "*",
-                    },
-                    {
-                        "type": "mrkdwn",
-                        "text": ":arrow_forward: *File SHA256: "
-                        + str(fileSHA256)
-                        + "*",
-                    },
-                ],
-            },
-            {
-                "type": "rich_text",
-                "elements": [
-                    {
-                        "type": "rich_text_section",
-                        "elements": [
-                            {"type": "text", "text": "Python3 lib update List"}
-                        ],
-                    },
-                    {"type": "rich_text_list", "style": "bullet", "elements": []},
-                ],
-            },
+                        "version": layerVersion,
+                        "id": id,
+                        "runtimeSetting": runtime.replace("_", ".").lower(),
+                        "packages": [],
+                    }
+                )
+
+            lambdaFinding_inventory = inspectUtil.list_findings(
+                {"lambdaFunctionName": [{"comparison": "EQUALS", "value": lambdaName}]}
+            )
+
+            """
+            sbom report와 inspector2 findlings list를 비교하기
+            """
+            packages = []
+            """
+            aws inspector service -> findings \
+                -> by lambda function -> findings -> Title value
+            ex:) vulnerability_pkg 
+            ['certifi']
+            ['urllib3']
+            ['certifi']
+            ['future']
+            ['urllib3']
+            ['requests']
+            """
+            vul_libName = [
+                vul__pkg["name"]
+                for finding_inventory in lambdaFinding_inventory["findings"]
+                for vul__pkg in finding_inventory["packageVulnerabilityDetails"][
+                    "vulnerablePackages"
+                ]
+            ]
+            vul_libName = list(set(vul_libName))
+
+            for pkg in scannInventory["components"]:
+                if (
+                    pkg["name"] in vul_libName
+                ):  # components 내 라이브러리 파일에 취약점이 존재할 경우
+                    vul_pkginfo = [
+                        vul_pkg
+                        for finding_inventory in lambdaFinding_inventory["findings"]
+                        for vul_pkg in finding_inventory["packageVulnerabilityDetails"][
+                            "vulnerablePackages"
+                        ]
+                        if vul_pkg["name"] == pkg["name"]
+                    ]
+
+                    installPkgVersion = [pkg["version"] for pkg in vul_pkginfo]
+                    installPkgVersion = installPkgVersion.pop()
+                    pkg["version"] = installPkgVersion
+                    pkg["cveInfo"] = vul_pkginfo
+
+                else:
+                    pass
+
+                packages.append(pkg)
+
+            output[lambdaName][
+                vul_pkginfo[0]["sourceLambdaLayerArn"]
+                .split(":layer:")[-1]
+                .split(":")[0]
+            ][0]["packages"] = packages
+
+            output[lambdaName][
+                vul_pkginfo[0]["sourceLambdaLayerArn"]
+                .split(":layer:")[-1]
+                .split(":")[0]
+            ][0]["updateFlag"] = True
+
+        return output
+
+    def newLayer_deploy(self, targetLambda, newArn):
+        """
+        수정된 Layer를 사용하는 Lambda목록을 리스트
+        추출 후 업데이트 수행
+        """
+        lambda_config = lmdUtil.get_function(targetLambda)
+        newConfig = []
+        existCfg = lambda_config["Configuration"]["Layers"]
+        newConfig = existCfg + newConfig
+        newConfig.append(newArn)
+        publish_results = lmdUtil.update_function_configuratio(targetLambda, newConfig)
+
+        return publish_results
+
+
+class EC2(COMMON):
+    def __init__(self, client):
+        self.client = client
+
+    def sendRunCommandBook(self, awsDocumentName, hostId, commands):
+        global ssmUtil
+        ssmUtil = awsUtill.ssmUtil(self.client)
+        shellCommand_results = ssmUtil.runCommandBook(awsDocumentName, hostId, commands)
+
+        return shellCommand_results
+
+    def inspectorFinding_export_remediation(self, findings_inventory_vulnerability):
+        return [
+            cveInfo["name"]
+            for cveInfo in findings_inventory_vulnerability[
+                "packageVulnerabilityDetails"
+            ]["vulnerablePackages"]
+        ], [
+            cveInfo["remediation"]
+            for cveInfo in findings_inventory_vulnerability[
+                "packageVulnerabilityDetails"
+            ]["vulnerablePackages"]
+            if "yum update" in cveInfo["remediation"]
         ]
-    }
 
-    for lib in writeMsg.split("\n"):
-        if len(lib) != 0:
-            sendMsg_format["blocks"][3]["elements"][1]["elements"].append(
-                {
-                    "type": "rich_text_section",
-                    "elements": [{"type": "text", "text": lib}],
+    def collection_service_vulnerability(self, inspectorScannList):
+        """
+        AWS Inspector 스캐닝 결과 값 export
+        -> Bucket 내 export 파일(resource 별 구분)로 취약점이 존재하는 EC2 Resource 수집
+        -> 수집된 EC2 InstanceID로 list_findings의로 취약점 목록을 dict화 형태로 리턴
+        ->
+        """
+        output = {}
+        for inspectorScanninventory in inspectorScannList:
+            for ec2MetaData in inspectorScanninventory["metadata"]["properties"]:
+                if "instance_id" in ec2MetaData["name"]:
+                    instance_id = ec2MetaData["value"]
+
+                if "ami" in ec2MetaData["name"]:
+                    ami_id = ec2MetaData["value"]
+
+                if "arn" in ec2MetaData["name"]:
+                    id = ec2MetaData["value"]
+
+            output[instance_id] = {}
+            lambdaFinding_inventory = inspectUtil.list_findings(
+                filterCriteria={
+                    "resourceId": [{"comparison": "EQUALS", "value": instance_id}]
                 }
             )
-
-    return [sendMsg_format]
-
-
-def options_parser():
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "-t",
-        "--update_target",
-        type=str,
-        action="store",
-        dest="update_target",
-        default="False",
-    )
-
-    (options) = parser.parse_args()
-
-    if len(sys.argv) < 3:
-        print_help()
-        sys.exit()
-
-    return options
-
-
-def main(vulnerability_update_resource, aws_config):
-    updateSuccess = []
-    for aws_env in aws_config:
-        if aws_env["Account Name"] in "To_Be Dev":
-            # aws_access_key_id = aws_env["AWS_ACCESS_KEY"]
-            # aws_secret_access_key = aws_env["AWS_SECRET_KEY"]
-            # account_id = aws_env["Account ID"]
-            # account_name = aws_env["Account Name"]
-
-            deps = {
-                "access_key": aws_env["AWS_ACCESS_KEY"],
-                "secret_key": aws_env["AWS_SECRET_KEY"],
-                "account_id": aws_env["Account ID"],
-                "account_name": aws_env["Account Name"],
-            }
-
-            awsSess = awsUtil.sessionCreator(deps)
-            cmn = COMMON(awsSess.client)
-            objReportdId = cmn.export_inspecotrSbom(
-                INSPECTOR_REPORT_FORMAT, BUCKETNAME, KMSKEYARN
-            )
-            print(objReportdId)
-
-            if vulnerability_update_resource == "lambda":
-                logging.info(
-                    "Extraction completed in lambda {} format \
-                             within {} account".format(
-                        INSPECTOR_REPORT_FORMAT, deps["account_id"]
-                    )
-                )
-                inspectorScannList = cmn.collection_bucketData(
-                    BUCKETNAME,
-                    INSPECTOR_REPORT_FORMAT
-                    + "_"
-                    + "outputs"
-                    + "_"
-                    + objReportdId
-                    + "/account="
-                    + deps["account_id"]
-                    + "/resource="
-                    + VULN_FIX_TARGET_TYPE,
-                )
-
-                LMDv1 = LMD(awsSess.client)
-                vul_dic = LMDv1.collection_service_vulnerability(inspectorScannList)
-
-                logging.info(
-                    "Completed dictation of inspector finding \
-                              information existing on Serverless base...."
-                )
-
-                for serverlessName in vul_dic:
-                    """
-                    Multiple layers can be used in a single Lambda.
-                    """
-                    for layerName in vul_dic[serverlessName].keys():
-                        sbomInfo = vul_dic[serverlessName][layerName]
-                        print(serverlessName + " " + layerName)
-
-                        if (layerName not in updateSuccess) and (
-                            "python" in sbomInfo[0]["runtimeSetting"].lower()
-                        ):
-                            """
-                            updateFlag는 Prisma 데이터 수집 시 CVE가 존재하는
-                            Layer의 경우 삽입된 key
-                            """
-                            if "updateFlag" in sbomInfo[0].keys():
-                                rqmts = LMDv1.export_fixVersion(sbomInfo)
-                                rqmtsRst = LMDv1.check_dependLib(rqmts)
-                                print(rqmtsRst)
-                                try:
-                                    venvResult = LMDv1.venvSet(rqmtsRst)
-                                    print(venvResult)
-                                    exit()
-
-                                    if venvResult == "successful":
-                                        newArn, status, sha256 = LMDv1.upload_layer(
-                                            BUCKETNAME, layerName
-                                        )
-
-                                        if newArn is not None:
-                                            print("{} updateing....".format(layerName))
-
-                                            """
-                                            수정된 Layer를 사용하는 Lambda목록을 리스트
-                                            추출 후 업데이트 수행
-                                            """
-                                            for targetLambda in [
-                                                lambdaName
-                                                for lambdaName in vul_dic
-                                                if layerName
-                                                in vul_dic[lambdaName].keys()
-                                            ]:
-                                                results = LMDv1.newLayer_deploy(
-                                                    targetLambda, newArn
-                                                )
-                                    else:
-                                        print("FileExistsError")
-                                        fileSHA256 = "None"
-                                        raise FileExistsError
-
-                                except FileExistsError as e:
-                                    updateStatus = "가상화 Lib 설치"
-
-                                except Exception as e:
-                                    updateStatus = "Layer Update 에러"
-
-                                """
-                                Slack msg 발송
-                                """
-                                logging.info("'{} Update Finished'".format(hostId))
-                                attachments_msg = slack_blockKit(
-                                    deps["account_id"],
-                                    hostId,
-                                    updateStatus,
-                                    fileSHA256,
-                                    rqmtsRst,
-                                )
-                                slackSession = requests.Session()
-                                slackSession.mount(
-                                    SLACK_WEBHOOK_URL, CustomSslContextHttpAdapter()
-                                )
-                                response = slackSession.post(
-                                    SLACK_WEBHOOK_URL,
-                                    headers={"Content-type": "application/json"},
-                                    data=json.dumps({"attachments": attachments_msg}),
-                                    verify=False,
-                                )
-
-                                updateSuccess.append(layerName)
-            elif vulnerability_update_resource == "ec2":
-                logging.info(
-                    "Extraction completed in Inspector {} format \
-                             within {} account".format(
-                        INSPECTOR_REPORT_FORMAT, deps["account_id"]
-                    )
-                )
-                inspectorScannList = cmn.collection_bucketData(
-                    BUCKETNAME,
-                    INSPECTOR_REPORT_FORMAT
-                    + "_"
-                    + "outputs"
-                    + "_"
-                    + objReportdId
-                    + "/account="
-                    + deps["account_id"]
-                    + "/resource="
-                    + VULN_FIX_TARGET_TYPE,
-                )
-
-                EC2v1 = EC2(awsSess)
-                print (inspectorScannList)
-                exit()
-                vul_dic = EC2v1.collection_service_vulnerability(inspectorScannList)
-                host_vulnerability_UpdateTarget = {}
-                logging.info(
-                    """
-                    Completed dictation of inspector finding information
-                    existing on EC2 host base....
-                    """
-                )
-
-                for hostId in vul_dic:
-                    # update를 수행할 EC2 Instance ID마다 refresh 변수
-                    updateLib_name = []  # list 변수
-                    remediate_command_list = []  # list 변수
-                    update_lib = ""
-                    host_vulnerability_UpdateTarget[hostId] = {}
-                    """
-                    EC2 host exception 
-                    """
-                    if hostId == "i-0029e3fe2f4c5a046":  ## 특정 인스턴스 테스트 수행
-                        for finding_inventory in vul_dic[hostId]["findings"]:
-                            requireUpdate_lib, remediate_list = (
-                                EC2v1.inspectorFinding_export_remediation(
-                                    finding_inventory
-                                )
-                            )
-                            if len(remediate_list) == 0:
-                                pass
-
-                            else:
-                                updateLib_name = updateLib_name + requireUpdate_lib
-                                remediate_command_list = (
-                                    remediate_command_list + remediate_list
-                                )
-                        """
-                        updateLib_name, remediate_list 그대로 사용해도 되지만,
-                        다른 취약점(ex: CVE-2024-1627, CVE-2023-52434) 업데이트를 위해
-                        동일한 command가 필요한 경우를 생략하기 위해 중복 제거를 수행함.
-                        """
-                        # os별 runcommand 호출
-                        # https://buly.kr/2UgbxAt
-                        if vul_dic[hostId]["runtimeSetting"] == "AMAZON_LINUX_2":
-                            awsDocumentName = "AWS-RunShellScript"
-                            commands = [
-                                "yum update -y "
-                                + str(" ".join(list(set(updateLib_name))))
-                            ]
-
-                        # elif == "windows":
-                        #    awsDocumnetName = "AWS-RunPowerShellScript"
-                        else:
-                            # DocumentName = "AWS-RunShellScript"
-                            commands = ""
-
-                        logging.info(
-                            """
-                            The query to update '{}' existing
-                            in '{}' of '{}' is '{}'
-                            """.format(
-                                str(" ".join(list(set(updateLib_name)))),
-                                vul_dic[hostId]["runtimeSetting"],
-                                hostId,
-                                commands,
-                            )
-                        )
-
-                        exit()
-                        shellCommand_results = EC2v1.sendRunCommandBook(
-                            awsDocumentName, hostId, commands
-                        )
-            elif vulnerability_update_resource == "ecr":
-                pass
-
-if __name__ == "__main__":
-    aws_config = ast.literal_eval(AWS_CONFIG)
-    options = options_parser()
-
-    if (options.update_target.lower() in ["serverless", "lambda"]) and len(
-        aws_config
-    ) != 0:
-        vulnerability_update_resource = "lambda"
-        VULN_FIX_TARGET_TYPE = "AWS_LAMBDA_FUNCTION"
-
-    elif (options.update_target.lower() in ["ec2", "host"]) and len(aws_config) != 0:
-        vulnerability_update_resource = "ec2"
-        VULN_FIX_TARGET_TYPE = "AWS_EC2_INSTANCE"
-    elif (options.update_target.lower() in ["ecr", "image"]) and len(aws_config) != 0:
-        vulnerability_update_resource = "ec2"
-        VULN_FIX_TARGET_TYPE = "AWS_EC2_INSTANCE"
-
-    else:
-        print_help()
-        exit()
-
-    main(vulnerability_update_resource, aws_config)
+            output[instance_id]["ami_id"] = ami_id
+            output[instance_id]["instance_id"] = instance_id.lower()
+            output[instance_id]["runtimeSetting"] = inspectorScanninventory["metadata"][
+                "component"
+            ]["name"]
+            output[instance_id]["findings"] = lambdaFinding_inventory["findings"]
+        return output

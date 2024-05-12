@@ -1,6 +1,8 @@
-import ast
-import os
 import json
+import ast
+import time
+import boto3
+import os
 import logging
 import warnings
 import urllib3
@@ -8,11 +10,12 @@ import requests
 from urllib3.util.ssl_ import create_urllib3_context
 from requests.adapters import HTTPAdapter
 import utility.aws as awsUtil
+from utility.work import COMMON, LMD, EC2
 import argparse
 import sys
 
 logging.basicConfig(level=logging.INFO)
-global awsSess
+
 try:
     AWS_CONFIG = os.environ["AWS_CONFIG"]
     BUCKETNAME = os.environ["BUCKETNAME"]
@@ -53,6 +56,69 @@ def print_help():
     """
     print(help_msg)
 
+def slack_blockKit(accountName, resourceName, updateStatus, fileSHA256, writeMsg):
+    sendMsg_format = {
+        "blocks": [
+            {
+                "type": "section",
+                "text": {"type": "mrkdwn", "text": "*Lambda Layer Update* :checked:"},
+            },
+            {"type": "divider"},
+            {
+                "type": "section",
+                "fields": [
+                    {
+                        "type": "mrkdwn",
+                        "text": ":arrow_forward: *Account Name :"
+                        + str(accountName)
+                        + "*",
+                    },
+                    {
+                        "type": "mrkdwn",
+                        "text": ":arrow_forward: *Layer Name :"
+                        + str(resourceName)
+                        + "*",
+                    },
+                    {
+                        "type": "mrkdwn",
+                        "text": ":arrow_forward: *UpdateStatus:"
+                        + str(updateStatus)
+                        + "*",
+                    },
+                    {
+                        "type": "mrkdwn",
+                        "text": ":arrow_forward: *File SHA256: "
+                        + str(fileSHA256)
+                        + "*",
+                    },
+                ],
+            },
+            {
+                "type": "rich_text",
+                "elements": [
+                    {
+                        "type": "rich_text_section",
+                        "elements": [
+                            {"type": "text", "text": "Python3 lib update List"}
+                        ],
+                    },
+                    {"type": "rich_text_list", "style": "bullet", "elements": []},
+                ],
+            },
+        ]
+    }
+
+    for lib in writeMsg.split("\n"):
+        if len(lib) != 0:
+            sendMsg_format["blocks"][3]["elements"][1]["elements"].append(
+                {
+                    "type": "rich_text_section",
+                    "elements": [{"type": "text", "text": lib}],
+                }
+            )
+
+    return [sendMsg_format]
+
 def options_parser():
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -72,120 +138,8 @@ def options_parser():
 
     return options
 
-def slack_blockKit(vulnerability_id, resourceId, resourceTags, PermissionChecker):
-    sendMsg_format = {
-        "blocks": [
-            {
-                "type": "section",
-                "text": {"type": "mrkdwn", "text": "*CVE search results* :checked:"},
-            },
-            {"type": "divider"},
-            {
-                "type": "section",
-                "fields": [
-                    {
-                        "type": "mrkdwn",
-                        "text": ":arrow_forward: *vulnerability_id :"
-                        + str(vulnerability_id)
-                        + "*",
-                    },
-                    {
-                        "type": "mrkdwn",
-                        "text": ":arrow_forward: *resourceId :"
-                        + str(resourceId)
-                        + "*",
-                    },
-                    {
-                        "type": "mrkdwn",
-                        "text": ":arrow_forward: *PermissionChecker: "
-                        + str(PermissionChecker)
-                        + "*",
-                    },
-                ],
-            },
-            {
-                "type": "rich_text",
-                "elements": [
-                    {
-                        "type": "rich_text_section",
-                        "elements": [
-                            {"type": "text", "text": "Python3 lib update List"}
-                        ],
-                    },
-                    {"type": "rich_text_list", "style": "bullet", "elements": []},
-                ],
-            },
-            {
-                "type": "actions",
-			    "elements": [
-                    {
-                        "type": "button",
-                        "text": {
-                            "type": "plain_text",
-                            "emoji": True,
-                            "text": "Deploy"
-                        },
-                        "style": "primary",
-                        "value": "click_me_123"
-                    }
-			    ]
-            }
-        ]
-    }
-
-    for key, value in resourceTags.items():
-        sendMsg_format["blocks"][3]["elements"][1]["elements"].append(
-            {
-                "type": "rich_text_section",
-                "elements": [{"type": "text", "text": str(key)+" : "+str(value)}],
-            }
-        )
-
-    return [sendMsg_format]
-
-def ssmChecker(resourceFinding):
-    global awsSess
-    PermissionChecker = False
-    
-    if "ec2" in resourceFinding["type"].lower():
-        instanceID = resourceFinding["id"]
-        ec2Util = awsUtil.ec2Util(awsSess.client)
-        iamUtil = awsUtil.iamUtil(awsSess.client)
-        ec2Info = ec2Util.describe_instances(instanceID)
-        iamArn = ec2Info["Reservations"][0][
-            "Instances"][0]["IamInstanceProfile"]["Arn"]
-        iamName = iamArn.split("/")[-1]
-        attachPolicy = iamUtil.get_role_policy(iamName)
-        
-        #SSM IAM 권한 체크
-        PermissionChecker = [True 
-            for policyInfo in attachPolicy["AttachedPolicies"] 
-            if policyInfo["PolicyName"] == "AmazonSSMManagedInstanceCore"].pop()
-        
-    return PermissionChecker
-    #elif "lambda" in resourceFinding["type"].lower():
-    #    print ("lambda 업데이트 필요, 람다는 layer를 업데이트 해야함")
-    #    print (resourceFinding)
-    #    lmdArn = resourceFinding["id"]
-    #    lmdId = lmdArn.split("function:")[-1].split(":")[0]
-    #    print (lmdId)
-    #    runtime = resourceFinding["details"][
-    #        "awsLambdaFunction"]["runtime"]
-    #    print (runtime)
-
-def runtimeChecker(findindInfo):
-    checker = False
-    if "LAMBDA" in findindInfo["type"]:
-        if "PYTHON" in findindInfo["details"]["awsLambdaFunction"]["runtime"]:
-            checker = True
-        else :
-            pass
-    elif "EC2" in findindInfo["type"]:
-        if "AMAZON" in findindInfo["details"]["awsEc2Instance"]["platform"]:
-            checker = True
-    return checker
-            
-def main(vulnerability_id, aws_config):
+def main(vulnerability_update_resource, aws_config):
+    updateSuccess = []
     for aws_env in aws_config:
         if aws_env["Account Name"] in "To_Be Dev":
             # aws_access_key_id = aws_env["AWS_ACCESS_KEY"]
@@ -199,118 +153,234 @@ def main(vulnerability_id, aws_config):
                 "account_id": aws_env["Account ID"],
                 "account_name": aws_env["Account Name"],
             }
-            global awsSess
+
             awsSess = awsUtil.sessionCreator(deps)
-            inspectUtil = awsUtil.inspectorUtil(awsSess.client)
-
-            #AWS Inspector에서 입력 받은 vulnerability 취약점을 제공 여부 확인
-            searchVul =inspectUtil.search_vulnerabilities(
-                {
-                    'vulnerabilityIds': [
-                        vulnerability_id
-                    ]
-                }
+            cmn = COMMON(awsSess.client)
+            objReportdId = cmn.export_inspecotrSbom(
+                INSPECTOR_REPORT_FORMAT, BUCKETNAME, KMSKEYARN
             )
-            
-            """
-            Inspector로 취약점 탐지 리소스 목록 수집 및 자동 배포 가능 여부 확인
-            """
-            if len(searchVul["vulnerabilities"]) > 0:
-                detectFlag = "탐지 가능"
-                findingList = inspectUtil.list_findings({
-                    'vulnerabilityId': [
-                        {
-                            'comparison': 'PREFIX',
-                            'value': vulnerability_id
-                        },
-                    ]
-                })
-                affectedList = [vul["resources"] 
-                                     for vul in findingList["findings"] 
-                                     if len(vul["resources"]) > 0
-                ]
-                #i-06cb2c6e4fdac48d7
-                #i-096a43ba285e2458a
-                for findingInfo in affectedList:
-                    resourceFinding = findingInfo[0]
-                    #lambda는 배포 설정한 python 검사, EC2는 OS 검사
-                    PermissionChecker = runtimeChecker(resourceFinding)
 
-                    if PermissionChecker is True:
-                        #EC2의 경우 IAM Role에 SSM 권한 추가 검사
-                        if "EC2" in resourceFinding["type"]:
-                            ssmFlag = ssmChecker(resourceFinding)
-                            if ssmFlag is False:
-                                PermissionChecker = False    
-                    
-                    else :
-                        PermissionChecker = False
+            if vulnerability_update_resource == "lambda":
+                logging.info(
+                    "Extraction completed in lambda {} format \
+                             within {} account".format(
+                        INSPECTOR_REPORT_FORMAT, deps["account_id"]
+                    )
+                )
+                inspectorScannList = cmn.collection_bucketData(
+                    BUCKETNAME,
+                    INSPECTOR_REPORT_FORMAT
+                    + "_"
+                    + "outputs"
+                    + "_"
+                    + objReportdId
+                    + "/account="
+                    + deps["account_id"]
+                    + "/resource="
+                    + VULN_FIX_TARGET_TYPE,
+                )
 
-                    print ("{} 취약점 조치 대상 : {}, 설명 : '{}', 조치 가능 여부 {}".format( vulnerability_id, resourceFinding["id"], resourceFinding["tags"],PermissionChecker ) )
+                LMDv1 = LMD(awsSess.client)
+                vul_dic = LMDv1.collection_service_vulnerability(inspectorScannList)
 
-                    if "function" in resourceFinding["id"]:
-                        resourceFinding["id"] = resourceFinding["id"].split("function:")[-1].split(":")[0]
-                    
-                    print (resourceFinding["tags"])
-                    
-                    #checkerDeploy = checkDeploy(resourceFinding)
-                    #exit()
+                logging.info(
+                    "Completed dictation of inspector finding \
+                              information existing on Serverless base...."
+                )
 
-                    #if checkerDeploy is True:
-                    #    cve_remediate = [
-                    #        vul_pkg["remediation"]
-                    #        for vul in findingList["findings"]
-                    #        for vul_pkg in vul["packageVulnerabilityDetails"][
-                    #            "vulnerablePackages"]
-                    #    ]
-                    #    cve_remediate = list(set(cve_remediate))
-                    #    print (cve_remediate)
+                for serverlessName in vul_dic:
+                    """
+                    Multiple layers can be used in a single Lambda.
+                    """
+                    for layerName in vul_dic[serverlessName].keys():
+                        sbomInfo = vul_dic[serverlessName][layerName]
+                        print(serverlessName + " " + layerName)
 
+                        if (layerName not in updateSuccess) and (
+                            "python" in sbomInfo[0]["runtimeSetting"].lower()
+                        ):
+                            """
+                            updateFlag는 Prisma 데이터 수집 시 CVE가 존재하는
+                            Layer의 경우 삽입된 key
+                            """
+                            if "updateFlag" in sbomInfo[0].keys():
+                                rqmts = LMDv1.export_fixVersion(sbomInfo)
+                                rqmtsRst = LMDv1.check_dependLib(rqmts)
+                                print(rqmtsRst)
+                                try:
+                                    venvResult = LMDv1.venvSet(rqmtsRst)
+                                    print(venvResult)
+                                    exit()
 
+                                    if venvResult == "successful":
+                                        newArn, status, sha256 = LMDv1.upload_layer(
+                                            BUCKETNAME, layerName
+                                        )
 
-                        #"""
-                        #취약점 조치를 위한 명령어 셋
-                        #"""
-                        #cve_remediate = [
-                        #        vul_pkg["remediation"]
-                        #        for vul in findingList["findings"]
-                        #        for vul_pkg in vul["packageVulnerabilityDetails"][
-                        #            "vulnerablePackages"]
-                        #    ]
-                        #cve_remediate = list(set(cve_remediate))
-                        #print (cve_remediate)
+                                        if newArn is not None:
+                                            print("{} updateing....".format(layerName))
 
-            else :
-                detectFlag = "탐지 불가능"
-                print (detectFlag)
+                                            """
+                                            수정된 Layer를 사용하는 Lambda목록을 리스트
+                                            추출 후 업데이트 수행
+                                            """
+                                            for targetLambda in [
+                                                lambdaName
+                                                for lambdaName in vul_dic
+                                                if layerName
+                                                in vul_dic[lambdaName].keys()
+                                            ]:
+                                                results = LMDv1.newLayer_deploy(
+                                                    targetLambda, newArn
+                                                )
+                                    else:
+                                        print("FileExistsError")
+                                        fileSHA256 = "None"
+                                        raise FileExistsError
 
-            attachments_msg = slack_blockKit(vulnerability_id, 
-                                   resourceFinding["id"],
-                                   resourceFinding["tags"],
-                                   PermissionChecker
-                                   )
-            slackSession = requests.Session()
-            slackSession.mount(SLACK_WEBHOOK_URL, 
-                                CustomSslContextHttpAdapter()
-            )
-            print (attachments_msg)
-            response = slackSession.post(
-                SLACK_WEBHOOK_URL,
-                headers={"Content-type": "application/json"},
-                data=json.dumps({"attachments": attachments_msg}),
-                verify=False,
-            )
-                    
+                                except FileExistsError as e:
+                                    updateStatus = "가상화 Lib 설치"
+
+                                except Exception as e:
+                                    updateStatus = "Layer Update 에러"
+
+                                """
+                                Slack msg 발송
+                                """
+                                logging.info("'{} Update Finished'".format(hostId))
+                                attachments_msg = slack_blockKit(
+                                    deps["account_id"],
+                                    hostId,
+                                    updateStatus,
+                                    fileSHA256,
+                                    rqmtsRst,
+                                )
+                                slackSession = requests.Session()
+                                slackSession.mount(
+                                    SLACK_WEBHOOK_URL, CustomSslContextHttpAdapter()
+                                )
+                                response = slackSession.post(
+                                    SLACK_WEBHOOK_URL,
+                                    headers={"Content-type": "application/json"},
+                                    data=json.dumps({"attachments": attachments_msg}),
+                                    verify=False,
+                                )
+
+                                updateSuccess.append(layerName)
+            elif vulnerability_update_resource == "ec2":
+                logging.info(
+                    "Extraction completed in Inspector {} format \
+                             within {} account".format(
+                        INSPECTOR_REPORT_FORMAT, deps["account_id"]
+                    )
+                )
+                inspectorScannList = cmn.collection_bucketData(
+                    BUCKETNAME,
+                    INSPECTOR_REPORT_FORMAT
+                    + "_"
+                    + "outputs"
+                    + "_"
+                    + objReportdId
+                    + "/account="
+                    + deps["account_id"]
+                    + "/resource="
+                    + VULN_FIX_TARGET_TYPE,
+                )
+
+                EC2v1 = EC2(awsSess)
+                print (inspectorScannList)
+                exit()
+                vul_dic = EC2v1.collection_service_vulnerability(inspectorScannList)
+                host_vulnerability_UpdateTarget = {}
+                logging.info(
+                    """
+                    Completed dictation of inspector finding information
+                    existing on EC2 host base....
+                    """
+                )
+
+                for hostId in vul_dic:
+                    # update를 수행할 EC2 Instance ID마다 refresh 변수
+                    updateLib_name = []  # list 변수
+                    remediate_command_list = []  # list 변수
+                    update_lib = ""
+                    host_vulnerability_UpdateTarget[hostId] = {}
+                    """
+                    EC2 host exception 
+                    """
+                    if hostId == "i-0029e3fe2f4c5a046":  ## 특정 인스턴스 테스트 수행
+                        for finding_inventory in vul_dic[hostId]["findings"]:
+                            requireUpdate_lib, remediate_list = (
+                                EC2v1.inspectorFinding_export_remediation(
+                                    finding_inventory
+                                )
+                            )
+                            if len(remediate_list) == 0:
+                                pass
+
+                            else:
+                                updateLib_name = updateLib_name + requireUpdate_lib
+                                remediate_command_list = (
+                                    remediate_command_list + remediate_list
+                                )
+                        """
+                        updateLib_name, remediate_list 그대로 사용해도 되지만,
+                        다른 취약점(ex: CVE-2024-1627, CVE-2023-52434) 업데이트를 위해
+                        동일한 command가 필요한 경우를 생략하기 위해 중복 제거를 수행함.
+                        """
+                        # os별 runcommand 호출
+                        # https://buly.kr/2UgbxAt
+                        if vul_dic[hostId]["runtimeSetting"] == "AMAZON_LINUX_2":
+                            awsDocumentName = "AWS-RunShellScript"
+                            commands = [
+                                "yum update -y "
+                                + str(" ".join(list(set(updateLib_name))))
+                            ]
+
+                        # elif == "windows":
+                        #    awsDocumnetName = "AWS-RunPowerShellScript"
+                        else:
+                            # DocumentName = "AWS-RunShellScript"
+                            commands = ""
+
+                        logging.info(
+                            """
+                            The query to update '{}' existing
+                            in '{}' of '{}' is '{}'
+                            """.format(
+                                str(" ".join(list(set(updateLib_name)))),
+                                vul_dic[hostId]["runtimeSetting"],
+                                hostId,
+                                commands,
+                            )
+                        )
+
+                        exit()
+                        shellCommand_results = EC2v1.sendRunCommandBook(
+                            awsDocumentName, hostId, commands
+                        )
+            elif vulnerability_update_resource == "ecr":
+                pass
 
 if __name__ == "__main__":
     aws_config = ast.literal_eval(AWS_CONFIG)
     options = options_parser()
 
-    if ("CVE" in options.update_target.upper() ):
-        vulnerability_id = options.update_target.upper()
-    
-    else :
+    if (options.update_target.lower() in ["serverless", "lambda"]) and len(
+        aws_config
+    ) != 0:
+        vulnerability_update_resource = "lambda"
+        VULN_FIX_TARGET_TYPE = "AWS_LAMBDA_FUNCTION"
+
+    elif (options.update_target.lower() in ["ec2", "host"]) and len(aws_config) != 0:
+        vulnerability_update_resource = "ec2"
+        VULN_FIX_TARGET_TYPE = "AWS_EC2_INSTANCE"
+    elif (options.update_target.lower() in ["ecr", "image"]) and len(aws_config) != 0:
+        vulnerability_update_resource = "ec2"
+        VULN_FIX_TARGET_TYPE = "AWS_EC2_INSTANCE"
+
+    else:
         print_help()
         exit()
-    
-    main(vulnerability_id, aws_config)
+
+    main(vulnerability_update_resource, aws_config)
